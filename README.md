@@ -16,6 +16,7 @@ Requirements
 ------------
 * Windows 10/11 with Python 3.10+ (includes the built-in `sqlite3` module).
 * The script checks that it can import `sqlite3`; if that fails, it exits.
+* Sorry, no idea if this will work with the Mac version.
 
 Purpose
 -------
