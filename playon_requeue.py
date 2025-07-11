@@ -1,4 +1,4 @@
-"""playon_requeue.py  –  General PlayOn Home re‑queue utility
+"""""playon_requeue.py  –  General PlayOn Home re‑queue utility
 
 Re‑queue failed (Status = 4) and, optionally, partially‑recorded (Status = 3)
 items in a PlayOn Home database. Written for Windows.
@@ -16,6 +16,7 @@ Features
    • --position POS        – where to insert:  beginning | end | after "Some Title".
    • --dry-run             – show what would be changed but don’t write.
    • --kill                – automatically kill running MediaMall processes.
+   • --all                 – requeue everything matching filters even if no title/date provided.
 3. Safe SQLite edits (single transaction); ranks auto‑calculated.
 
 Example
@@ -39,10 +40,6 @@ from typing import List, Tuple
 DB_PATH_DEFAULT = r"C:\ProgramData\MediaMall\Recording\recording.db"
 PROCESS_NAMES   = ("PlayOn", "MediaMallServer", "MediaMall", "SettingsManager", "POC-Downloader" )
 
-# ---------------------------------------------------------------------------
-# helper: parse --since
-# ---------------------------------------------------------------------------
-
 def parse_since(token: str) -> datetime:
     token = token.lower()
     now   = datetime.now(timezone.utc)
@@ -52,24 +49,18 @@ def parse_since(token: str) -> datetime:
     if token == "yesterday":
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         return today - timedelta(days=1)
-    if token in ("this-week", "week", "w"):  # Monday start
+    if token in ("this-week", "week", "w"):
         start = now - timedelta(days=now.weekday())
         return start.replace(hour=0, minute=0, second=0, microsecond=0)
     if token in ("this-month", "month", "m"):
         return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-    # MM-DD-YY
     try:
         return datetime.strptime(token, "%m-%d-%y").replace(tzinfo=timezone.utc)
     except ValueError:
         raise argparse.ArgumentTypeError(f"Unrecognised --since value: {token}")
 
-# ---------------------------------------------------------------------------
-# helper: find/kill running processes
-# ---------------------------------------------------------------------------
-
 def find_running_pids() -> List[int]:
-    """Return PIDs of running PlayOn/MediaMall processes."""
     pids = []
     try:
         output = subprocess.check_output("tasklist /FO CSV", text=True)
@@ -81,14 +72,9 @@ def find_running_pids() -> List[int]:
         pass
     return pids
 
-# ---------------------------------------------------------------------------
-# main requeue logic
-# ---------------------------------------------------------------------------
-
 def build_where(args) -> Tuple[str, List]:
     clauses, params = [], []
 
-    # status filter
     statuses = [4]
     if args.include_partial:
         statuses.append(3)
@@ -96,7 +82,6 @@ def build_where(args) -> Tuple[str, List]:
     clauses.append(f"Status IN ({placeholders})")
     params.extend(statuses)
 
-    # titles
     if args.title:
         title_clauses = []
         for t in args.title:
@@ -104,18 +89,15 @@ def build_where(args) -> Tuple[str, List]:
             params.extend([t.lower(), t.lower()])
         clauses.append("(" + " OR ".join(title_clauses) + ")")
 
-    # movies‑only
     if args.movies_only:
         clauses.append("Season IS NULL AND EpisodeNumber IS NULL")
 
-    # since
     if args.since_dt:
         clauses.append("Updated >= ?")
         params.append(args.since_dt.strftime("%Y-%m-%d %H:%M:%S"))
 
     where_sql = " AND ".join(clauses) if clauses else "1"
     return where_sql, params
-
 
 def compute_insert_ranks(cur, count: int, position: str, after_title: str | None):
     if position == "beginning":
@@ -130,9 +112,9 @@ def compute_insert_ranks(cur, count: int, position: str, after_title: str | None
         ).fetchone()[0]
         return [max_rank + i + 1 for i in range(count)]
 
-    # after "Some Title"
     row = cur.execute(
-        "SELECT Rank FROM RecordQueueItems WHERE (SeriesTitle = ? OR Name = ?) AND Status IN (0,1)\n         ORDER BY Rank LIMIT 1",
+        "SELECT Rank FROM RecordQueueItems WHERE (SeriesTitle = ? OR Name = ?) AND Status IN (0,1)"
+        " ORDER BY Rank LIMIT 1",
         (after_title, after_title)
     ).fetchone()
     if not row:
@@ -140,8 +122,11 @@ def compute_insert_ranks(cur, count: int, position: str, after_title: str | None
     base = row[0]
     return [base + (i + 1) * 0.001 for i in range(count)]
 
-
 def requeue_items(args):
+    if not args.all and not (args.title or args.since or args.movies_only or args.include_partial):
+        print("Can not requeue all items unless --all is specified. Please select a filtering option or specify --all.")
+        return
+
     con = sqlite3.connect(args.db)
     cur = con.cursor()
 
@@ -180,13 +165,12 @@ def requeue_items(args):
     con.commit()
     print(f"Promoted {len(to_promote)} item(s). PlayOn must be restarted to reload the queue.")
 
-
-# ---------------------------------------------------------------------------
-# Argument parsing & entry point
-# ---------------------------------------------------------------------------
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Re‑queue failed/partial PlayOn recordings.")
+    if "--help" in sys.argv:
+        print(__doc__)
+        sys.exit(0)
+
+    p = argparse.ArgumentParser(description="Re‑queue failed/partial PlayOn recordings.", add_help=False)
     p.add_argument("--db", default=DB_PATH_DEFAULT, help="Path to recording.db")
     p.add_argument("--title", action="append", help="Title or SeriesTitle to match (repeatable)")
     p.add_argument("--since", dest="since", help="Date filter: today|yesterday|this-week|this-month|MM-DD-YY")
@@ -196,15 +180,13 @@ def parse_args():
     p.add_argument("--after-title", help="Title to insert after (required if --position after)")
     p.add_argument("--kill", action="store_true", help="Kill running PlayOn processes automatically")
     p.add_argument("--dry-run", action="store_true", help="Do not modify DB; just list actions")
+    p.add_argument("--all", action="store_true", help="Allow requeueing of all matching items without filters")
     return p.parse_args()
 
 def main():
     args = parse_args()
-
-    # since parsing
     args.since_dt = parse_since(args.since) if args.since else None
 
-    # process handling
     running = find_running_pids()
     if running:
         print(f"Detected running PlayOn processes: {running}")
