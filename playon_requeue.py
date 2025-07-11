@@ -1,4 +1,5 @@
-"""playon_requeue.py  -  General PlayOn Home re‑queue utility
+"""
+playon_requeue.py  -  General PlayOn Home re‑queue utility
 =========================================================
 
 **READ THIS FIRST ‑‑ HIGH RISK OPERATION!**
@@ -55,27 +56,47 @@ python playon_requeue.py --title "Mythbusters" --since this-week --kill --positi
 ```
 """
 
+# ---------------------------------------------------------------------------
+#  Standard Library Imports
+# ---------------------------------------------------------------------------
 import argparse
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
-import os
-import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
+# ---------------------------------------------------------------------------
+#  Global Constants
+# ---------------------------------------------------------------------------
 DB_PATH_DEFAULT = r"C:\ProgramData\MediaMall\Recording\recording.db"
-PROCESS_NAMES   = ("PlayOn", "MediaMallServer", "MediaMall", "SettingsManager", "POC-Downloader" )
+BACKUP_TEMPLATE = "recording.db.bak-{stamp}"
+PROCESS_NAMES   = (
+    "PlayOn", "MediaMallServer", "MediaMall", "SettingsManager", "POC-Downloader"
+)
 
+# ---------------------------------------------------------------------------
+#  Utility: Pretty Timestamp
+# ---------------------------------------------------------------------------
+STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# ---------------------------------------------------------------------------
+#  Utility: Parse --since into a UTC datetime
+# ---------------------------------------------------------------------------
+
+# Converts user input like "yesterday" or "this-month" to a timezone-aware UTC datetime.
 def parse_since(token: str) -> datetime:
+    if token is None:
+        return None
     token = token.lower()
     now   = datetime.now(timezone.utc)
 
     if token == "today":
         return now.replace(hour=0, minute=0, second=0, microsecond=0)
     if token == "yesterday":
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return today - timedelta(days=1)
+        return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     if token in ("this-week", "week", "w"):
         start = now - timedelta(days=now.weekday())
         return start.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -84,13 +105,18 @@ def parse_since(token: str) -> datetime:
 
     try:
         return datetime.strptime(token, "%m-%d-%y").replace(tzinfo=timezone.utc)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Unrecognised --since value: {token}")
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(f"Invalid --since value: {token}") from err
 
+# ---------------------------------------------------------------------------
+#  Utility: Detect running PlayOn / MediaMall processes (returns PID list)
+# ---------------------------------------------------------------------------
+
+# Returns a list of matching PIDs for known PlayOn/MediaMall-related processes.
 def find_running_pids() -> List[int]:
-    pids = []
+    pids: List[int] = []
     try:
-        output = subprocess.check_output("tasklist /FO CSV", text=True)
+        output = subprocess.check_output("tasklist /FO CSV", text=True, encoding="utf-8", errors="ignore")
         for line in output.splitlines()[1:]:
             cols = [c.strip('"') for c in line.split(',')]
             if cols and cols[0].split('.')[0] in PROCESS_NAMES:
@@ -99,22 +125,37 @@ def find_running_pids() -> List[int]:
         pass
     return pids
 
-def build_where(args) -> Tuple[str, List]:
-    clauses, params = [], []
+# ---------------------------------------------------------------------------
+#  Utility: Create a safety backup of the database file
+# ---------------------------------------------------------------------------
 
-    statuses = [4]
-    if args.include_partial:
-        statuses.append(3)
-    placeholders = ",".join(["?"] * len(statuses))
-    clauses.append(f"Status IN ({placeholders})")
-    params.extend(statuses)
+# Makes a timestamped backup copy of the recording.db before editing.
+def backup_database(db_path: str) -> str:
+    backup_name = BACKUP_TEMPLATE.format(stamp=STAMP)
+    backup_path = os.path.join(os.path.dirname(db_path), backup_name)
+    shutil.copy2(db_path, backup_path)
+    print(f"Database backed up to: {backup_path}")
+    return backup_path
+
+# ---------------------------------------------------------------------------
+#  Build dynamic SQL WHERE clause from CLI filters
+# ---------------------------------------------------------------------------
+
+# Constructs the WHERE clause used to fetch only items matching CLI filters.
+def build_where(args) -> Tuple[str, List]:
+    clauses: List[str] = []
+    params:  List      = []
+
+    status_codes = [4] + ([3] if args.include_partial else [])
+    clauses.append(f"Status IN ({','.join(['?']*len(status_codes))})")
+    params.extend(status_codes)
 
     if args.title:
-        title_clauses = []
+        t_clauses = []
         for t in args.title:
-            title_clauses.append("lower(SeriesTitle) = ? OR lower(Name) = ?")
+            t_clauses.append("lower(SeriesTitle) = ? OR lower(Name) = ?")
             params.extend([t.lower(), t.lower()])
-        clauses.append("(" + " OR ".join(title_clauses) + ")")
+        clauses.append(f"({' OR '.join(t_clauses)})")
 
     if args.movies_only:
         clauses.append("Season IS NULL AND EpisodeNumber IS NULL")
@@ -123,9 +164,13 @@ def build_where(args) -> Tuple[str, List]:
         clauses.append("Updated >= ?")
         params.append(args.since_dt.strftime("%Y-%m-%d %H:%M:%S"))
 
-    where_sql = " AND ".join(clauses) if clauses else "1"
-    return where_sql, params
+    return " AND ".join(clauses) if clauses else "1", params
 
+# ---------------------------------------------------------------------------
+#  Compute target ranks for inserting new items
+# ---------------------------------------------------------------------------
+
+# Given the insert mode, computes the new queue rank(s) for added items.
 def compute_insert_ranks(cur, count: int, position: str, after_title: str | None):
     if position == "beginning":
         min_rank = cur.execute(
@@ -140,12 +185,13 @@ def compute_insert_ranks(cur, count: int, position: str, after_title: str | None
         return [max_rank + i + 1 for i in range(count)]
 
     row = cur.execute(
-        "SELECT Rank FROM RecordQueueItems WHERE (SeriesTitle = ? OR Name = ?) AND Status IN (0,1)"
+        "SELECT Rank FROM RecordQueueItems"
+        " WHERE (SeriesTitle = ? OR Name = ?) AND Status IN (0,1)"
         " ORDER BY Rank DESC LIMIT 1",
         (after_title, after_title)
     ).fetchone()
-    if not row:
-        raise ValueError(f'Could not find queued/recording item titled "{after_title}"')
+    if row is None:
+        raise ValueError(f'Anchor title "{after_title}" not found in current queue.')
     base = row[0]
     return [base + (i + 1) * 0.001 for i in range(count)]
 
