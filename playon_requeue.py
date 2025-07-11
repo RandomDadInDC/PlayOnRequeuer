@@ -41,7 +41,6 @@ Command-line Flags (stackable)
 - `--include-partial`     Include `Status = 3` (partial) items in search.
 - `--position {beginning|end|after}`  Where to insert.
 - `--after-title "TITLE"` Title anchor required if `--position after`.
-- `--clear-notifications` Delete associated notifications for re-queued items.
 - `--dry-run`             Show current queue *and* proposed queue; no edits.
 - `--dry-run-output FILE` Export dry-run proposed additions to a CSV file.
 - `--kill`                Kill running PlayOn / MediaMall processes first.
@@ -56,10 +55,10 @@ Examples
 --------
 ```
 python playon_requeue.py --title "The Day of the Jackal" --movies-only --include-partial --since this-month --position end
-python playon_requeue.py --title "Columbo" --since 06-01-24 --position beginning --clear-notifications
+python playon_requeue.py --title "Columbo" --since 06-01-24 --position beginning
 python playon_requeue.py --title "Babylon 5" --position after --after-title "Babylon 5"
 python playon_requeue.py --movies-only --since yesterday --include-partial --dry-run
-python playon_requeue.py --title "Mythbusters" --since this-week --restart --clear-notifications
+python playon_requeue.py --title "Mythbusters" --since this-week --restart
 ```
 """
 
@@ -74,7 +73,6 @@ import subprocess
 import sys
 import csv
 import time
-import ctypes
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
@@ -86,35 +84,11 @@ BACKUP_TEMPLATE = "recording.db.bak-{stamp}"
 PROCESS_NAMES   = (
     "PlayOn", "MediaMallServer", "MediaMall", "SettingsManager", "POC-Downloader"
 )
-# The name of the Windows Service for the PlayOn server.
-PLAYON_SERVICE_NAME = "PlayOn"
 
 # ---------------------------------------------------------------------------
 #  Utility: Pretty Timestamp
 # ---------------------------------------------------------------------------
 STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
-
-# ---------------------------------------------------------------------------
-#  Windows Privilege Management Utilities
-# ---------------------------------------------------------------------------
-def is_admin():
-    """Check if the script is running with administrative privileges."""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-def run_as_admin():
-    """
-    Re-launches the script with administrator privileges using a UAC prompt.
-    """
-    try:
-        params = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-        return True
-    except Exception as e:
-        print(f"Error attempting to elevate privileges: {e}")
-        return False
 
 # ---------------------------------------------------------------------------
 #  Utility: Interpolate SQL for logging
@@ -173,6 +147,7 @@ def find_playon_processes() -> List[Tuple[int, str]]:
                     if path and pid_str:
                         processes.append((int(pid_str), path))
     except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        # Fallback to tasklist if WMIC fails, though this won't get paths for restart.
         return [(pid, "") for pid in find_running_pids_fallback()]
     return processes
 
@@ -193,29 +168,25 @@ def find_running_pids_fallback() -> List[int]:
 #  Utility: Restart PlayOn Services
 # ---------------------------------------------------------------------------
 def restart_services(paths: List[str]):
-    """
-    Restarts the provided list of executables. It uses 'net start' for the
-    Windows Service and Popen for regular applications.
-    """
+    """Restarts the provided list of executables, prioritizing the server."""
     print("\nRestarting PlayOn services...")
-    server_was_running = False
+    server_path = None
     other_paths = []
 
     for path in paths:
         if os.path.basename(path).lower() == 'mediamallserver.exe':
-            server_was_running = True
+            server_path = path
         else:
             other_paths.append(path)
 
-    if server_was_running:
+    if server_path:
         try:
-            print(f"  Starting PlayOn service ({PLAYON_SERVICE_NAME})...")
-            subprocess.run(["net", "start", PLAYON_SERVICE_NAME], check=True, capture_output=True)
+            print(f"  Starting server: {server_path}")
+            subprocess.Popen([server_path])
             print("  Waiting 10 seconds for server to initialize...")
             time.sleep(10)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"  Error starting PlayOn service: {e}")
-            print("  This usually means the script was not run with administrator privileges.")
+        except OSError as e:
+            print(f"  Error starting server: {e}")
             return
 
     for path in other_paths:
@@ -314,15 +285,11 @@ def requeue_items(args):
     if args.dry_run:
         print("\nDRY RUN - The following items would be requeued:")
         # ... (dry run logic remains the same)
-        if args.clear_notifications:
-            print(f"\nAssociated notifications for these {len(to_promote)} items would also be deleted.")
         con.close()
         return
 
     print("\n" + "="*60 + "\n!! WARNING: HIGH RISK OPERATION !!\n" + "="*60)
     print(f"You are about to re-queue {len(to_promote)} item(s).")
-    if args.clear_notifications:
-        print("Associated notifications will also be deleted.")
     if not args.no_backup: print("\nA backup will be created.")
     else: print("\nWARNING: You have specified --no-backup.")
 
@@ -347,12 +314,8 @@ def requeue_items(args):
         cur.execute("BEGIN TRANSACTION;")
         for (rec_id, *rest), new_rank in zip(to_promote, ranks):
             cur.execute("UPDATE RecordQueueItems SET Status=0, Rank=?, Error=NULL, Queued=?, Updated=? WHERE ID=?", (new_rank, utc_now, utc_now, rec_id))
-            if args.clear_notifications:
-                cur.execute("DELETE FROM Notifications WHERE RecordingID = ?", (rec_id,))
         con.commit()
-        
-        deleted_msg = " and cleared associated notifications" if args.clear_notifications else ""
-        print(f"\nSuccess! Promoted {len(to_promote)} item(s){deleted_msg}.")
+        print(f"\nSuccess! Promoted {len(to_promote)} item(s).")
         if not args.restart: print("PlayOn must be restarted to reload the queue.")
     except sqlite3.Error as e:
         print(f"\nAn error occurred during the database transaction: {e}")
@@ -369,7 +332,6 @@ def parse_args():
     p.add_argument("--include-partial", action="store_true", help="Include Status=3 (partial) rows in addition to Status=4 (failed).")
     p.add_argument("--position", default="end", choices=["beginning", "end", "after"], help="Where to insert new items. Default: %(default)s")
     p.add_argument("--after-title", help="Title to insert after (required if --position is 'after').")
-    p.add_argument("--clear-notifications", action="store_true", help="Delete associated notifications for re-queued items.")
     p.add_argument("--kill", action="store_true", help="Kill running PlayOn processes automatically before running.")
     p.add_argument("--restart", action="store_true", help="Kill, re-queue, and then restart PlayOn services. Implies --kill.")
     p.add_argument("--dry-run", action="store_true", help="Do not modify DB; just list the actions that would be taken.")
@@ -388,15 +350,6 @@ def main():
 
     args = parse_args()
     
-    if args.restart and not is_admin():
-        print("The --restart flag requires administrator privileges to start the PlayOn service.")
-        print("Attempting to re-launch with elevated rights...")
-        if run_as_admin():
-            sys.exit(0)
-        else:
-            print("\nFailed to elevate privileges. Please run the script from an administrator command prompt to use --restart.")
-            sys.exit(1)
-
     if args.position == 'after' and not args.after_title:
         print("Error: --after-title is required when using --position 'after'"); sys.exit(1)
     if not any([args.title, args.since, args.movies_only, args.include_partial, args.all]):
