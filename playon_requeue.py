@@ -1,23 +1,23 @@
-"""""playon_requeue.py  –  General PlayOn Home re‑queue utility
+"""playon_requeue.py  -  General PlayOn Home re-queue utility
 
-Re‑queue failed (Status = 4) and, optionally, partially‑recorded (Status = 3)
+Re-queue failed (Status = 4) and, optionally, partially-recorded (Status = 3)
 items in a PlayOn Home database. Written for Windows.
 
 Features
 --------
-1. Detect MediaMall / PlayOn processes; optional ‑‑kill flag to terminate them
+1. Detect MediaMall / PlayOn processes; optional --kill flag to terminate them
    before modifying the DB.
-2. Command‑line arguments (stackable):
-   • --title "TITLE"      (may be repeated)      – match SeriesTitle or Name.
-   • --since KEYWORD       – filter by date; KEYWORD ∈ {today, yesterday,
-                             this-week, this-month, MM‑DD‑YY}. Default: none.
-   • --movies-only         – only rows where Season IS NULL AND EpisodeNumber IS NULL.
-   • --include-partial     – include Status 3 (partial) as well as Status 4.
-   • --position POS        – where to insert:  beginning | end | after "Some Title".
-   • --dry-run             – show what would be changed but don’t write.
-   • --kill                – automatically kill running MediaMall processes.
-   • --all                 – requeue everything matching filters even if no title/date provided.
-3. Safe SQLite edits (single transaction); ranks auto‑calculated.
+2. Command-line arguments (stackable):
+   - --title "TITLE"      (may be repeated)      - match SeriesTitle or Name.
+   - --since KEYWORD       - filter by date; KEYWORD in {today, yesterday,
+                             this-week, this-month, MM-DD-YY}. Default: none.
+   - --movies-only         - only rows where Season IS NULL AND EpisodeNumber IS NULL.
+   - --include-partial     - include Status 3 (partial) as well as Status 4.
+   - --position POS        - where to insert:  beginning | end | after "Some Title".
+   - --dry-run             - show what would be changed but don't write.
+   - --kill                - automatically kill running MediaMall processes.
+   - --all                 - requeue everything matching filters even if no title/date provided.
+3. Safe SQLite edits (single transaction); ranks auto-calculated.
 
 Example
 -------
@@ -114,7 +114,7 @@ def compute_insert_ranks(cur, count: int, position: str, after_title: str | None
 
     row = cur.execute(
         "SELECT Rank FROM RecordQueueItems WHERE (SeriesTitle = ? OR Name = ?) AND Status IN (0,1)"
-        " ORDER BY Rank LIMIT 1",
+        " ORDER BY Rank DESC LIMIT 1",
         (after_title, after_title)
     ).fetchone()
     if not row:
@@ -138,11 +138,20 @@ def requeue_items(args):
         print("No matching failed/partial rows found.")
         return
 
-    print(f"Found {len(to_promote)} item(s) to re‑queue.")
+    print(f"Found {len(to_promote)} item(s) to re-queue.")
     ranks = compute_insert_ranks(cur, len(to_promote), args.position, args.after_title)
 
     if args.dry_run:
-        print("\nDRY RUN – the following IDs would be queued:")
+        print("\nDRY RUN - the following items would be requeued:\n")
+
+        print("Current Queue:")
+        existing = cur.execute(
+            "SELECT ID, Rank, Name, SeriesTitle FROM RecordQueueItems WHERE Status IN (0,1) ORDER BY Rank"
+        ).fetchall()
+        for rec_id, rank, name, series in existing:
+            print(f"  ID {rec_id:>6}  Rank={rank:<8}  {series or name}")
+
+        print("\nProposed additions:")
         for (rec_id, _, name, series), r in zip(to_promote, ranks):
             print(f"  ID {rec_id:>6}  Rank->{r:<8}  {series or name}")
         return
@@ -170,7 +179,7 @@ def parse_args():
         print(__doc__)
         sys.exit(0)
 
-    p = argparse.ArgumentParser(description="Re‑queue failed/partial PlayOn recordings.", add_help=False)
+    p = argparse.ArgumentParser(description="Re-queue failed/partial PlayOn recordings.", add_help=False)
     p.add_argument("--db", default=DB_PATH_DEFAULT, help="Path to recording.db")
     p.add_argument("--title", action="append", help="Title or SeriesTitle to match (repeatable)")
     p.add_argument("--since", dest="since", help="Date filter: today|yesterday|this-week|this-month|MM-DD-YY")
