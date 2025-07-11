@@ -3,10 +3,10 @@
 Running this script will modify *recording.db* used by PlayOn Home.  A corrupt or
 inconsistent database can prevent PlayOn from launching or recording correctly.
 
-* Make sure PlayOn Home is **COMPLETELY CLOSED** (tray icon exited) **or** use
+* Make sure PlayOn Home is **COMPLETELY CLOSED** (tray icon exited) or use
    the `--kill` or `--restart` flag so the script can manage the processes.
    (Note: --restart may not work right yet.)
-* The script **creates a timestamped backup** copy of the original database
+* The script creates a timestamped backup copy of the original database
    (`recording.db.bak-YYYYMMDD-HHMMSS`) in the same directory before any write.
 * Use `--dry-run` first.  It prints what *would* change and makes **NO** edits.
 * You are solely responsible for any data loss or disruption.  Running this
