@@ -1,31 +1,58 @@
-"""playon_requeue.py  -  General PlayOn Home re-queue utility
+"""playon_requeue.py  -  General PlayOn Home re‑queue utility
+=========================================================
 
-Re-queue failed (Status = 4) and, optionally, partially-recorded (Status = 3)
-items in a PlayOn Home database. Written for Windows.
+**READ THIS FIRST ‑‑ HIGH RISK OPERATION!**
+-------------------------------------------------
+Running this script will modify *recording.db* used by PlayOn Home.  A corrupt or
+inconsistent database can prevent PlayOn from launching or recording correctly.
 
-Features
---------
-1. Detect MediaMall / PlayOn processes; optional --kill flag to terminate them
-   before modifying the DB.
-2. Command-line arguments (stackable):
-   - --title "TITLE"      (may be repeated)      - match SeriesTitle or Name.
-   - --since KEYWORD       - filter by date; KEYWORD in {today, yesterday,
-                             this-week, this-month, MM-DD-YY}. Default: none.
-   - --movies-only         - only rows where Season IS NULL AND EpisodeNumber IS NULL.
-   - --include-partial     - include Status 3 (partial) as well as Status 4.
-   - --position POS        - where to insert:  beginning | end | after "Some Title".
-   - --dry-run             - show what would be changed but don't write.
-   - --kill                - automatically kill running MediaMall processes.
-   - --all                 - requeue everything matching filters even if no title/date provided.
-3. Safe SQLite edits (single transaction); ranks auto-calculated.
+*  Make sure PlayOn Home is **COMPLETELY CLOSED** (tray icon exited) **or** use
+   the `--kill` flag so the script force‑kills any MediaMall processes.
+*  The script **creates a timestamped backup** copy of the original database
+   (`recording.db.bak‑YYYYMMDD‑HHMMSS`) in the same directory before any write.
+*  Use `--dry‑run` first.  It prints what *would* change and makes **NO** edits.
+*  You are solely responsible for any data loss or disruption.  Running this
+   script *probably voids any warranty*.
 
-Example
+Requirements
+------------
+* Windows 10/11 with Python 3.10+ (includes the built‑in `sqlite3` module).
+* The script checks that it can import `sqlite3`; if that fails, it exits.
+
+Purpose
 -------
+PlayOn Home is great but when it fails, it REALLY fails. This script handles 
+it when your network suddenly goes down and you end up with hundreds of failed
+recordings. No more individually clicking multiple times to re-add each movie or
+show back into your queue!
+
+This script will re‑queue failed recordings (`Status = 4`) and optionally 
+partially‑recorded shows (`Status = 3`).  You can filter by title, date, 
+movie‑only, etc., and insert the re‑queued items at the beginning, end, or 
+immediately after the last occurrence of a given title in the current queue.
+
+Command-line Flags (stackable)
+--------------------
+- `--title "TITLE"`        Match SeriesTitle *or* Name (repeatable).
+- `--since KEYWORD`        `today`, `yesterday`, `this‑week`, `this‑month`, or
+                           an explicit `MM‑DD‑YY` date.
+- `--movies-only`          Only rows with **no** Season/Episode number.
+- `--include-partial`      Include `Status = 3` (partial) items in search.
+- `--position {beginning|end|after}`  Where to insert.
+- `--after-title "TITLE"` Title anchor required if `--position after`.
+- `--dry-run`              Show current queue *and* proposed queue; no edits.
+- `--kill`                 Kill running PlayOn / MediaMall processes first.
+- `--all`                  Allow mass re‑queue when no other filters are given.
+
+Examples
+--------
+```
 python playon_requeue.py --title "The Day of the Jackal" --movies-only --include-partial --since this-month --position end
 python playon_requeue.py --title "Columbo" --since 06-01-24 --position beginning
 python playon_requeue.py --title "Babylon 5" --position after --after-title "Babylon 5"
 python playon_requeue.py --movies-only --since yesterday --include-partial --dry-run
 python playon_requeue.py --title "Mythbusters" --since this-week --kill --position end
+```
 """
 
 import argparse
@@ -131,7 +158,7 @@ def requeue_items(args):
     cur = con.cursor()
 
     where_sql, params = build_where(args)
-    query = f"SELECT ID, Rank, Name, SeriesTitle FROM RecordQueueItems WHERE {where_sql} ORDER BY Updated DESC"
+    query = f"SELECT ID, Rank, Name, SeriesTitle, Season, EpisodeNumber FROM RecordQueueItems WHERE {where_sql} ORDER BY Updated DESC"
     to_promote = cur.execute(query, params).fetchall()
 
     if not to_promote:
@@ -146,19 +173,25 @@ def requeue_items(args):
 
         print("Current Queue:")
         existing = cur.execute(
-            "SELECT ID, Rank, Name, SeriesTitle FROM RecordQueueItems WHERE Status IN (0,1) ORDER BY Rank"
+            "SELECT ID, Rank, Name, SeriesTitle, Season, EpisodeNumber FROM RecordQueueItems WHERE Status IN (0,1) ORDER BY Rank"
         ).fetchall()
-        for rec_id, rank, name, series in existing:
-            print(f"  ID {rec_id:>6}  Rank={rank:<8}  {series or name}")
+        for rec_id, rank, name, series, season, episode in existing:
+            info = series or name
+            if season is not None and episode is not None:
+                info += f" S{int(season):02}E{int(episode):02}"
+            print(f"  ID {rec_id:>6}  Rank={rank:<8}  {info}")
 
         print("\nProposed additions:")
-        for (rec_id, _, name, series), r in zip(to_promote, ranks):
-            print(f"  ID {rec_id:>6}  Rank->{r:<8}  {series or name}")
+        for (rec_id, _, name, series, season, episode), r in zip(to_promote, ranks):
+            info = series or name
+            if season is not None and episode is not None:
+                info += f" S{int(season):02}E{int(episode):02}"
+            print(f"  ID {rec_id:>6}  Rank->{r:<8}  {info}")
         return
 
     utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     cur.execute("BEGIN TRANSACTION;")
-    for (rec_id, _, _, _), new_rank in zip(to_promote, ranks):
+    for (rec_id, _, _, _, _, _), new_rank in zip(to_promote, ranks):
         cur.execute(
             """
             UPDATE RecordQueueItems
