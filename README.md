@@ -47,6 +47,7 @@ Command-line Flags (stackable)
 - `--limit N`             Limit the number of items to re-queue.
 - `--verbose`             Print verbose output, like SQL statements.
 - `--no-backup`           Skip creating a database backup (NOT RECOMMENDED).
+- `--analyze`             Provides a detailed report of the current queue and exits.
 
 Examples
 --------
@@ -56,6 +57,7 @@ python playon_requeue.py --title "Columbo" --since 06-01-24 --position beginning
 python playon_requeue.py --title "Babylon 5" --position after --after-title "Babylon 5"
 python playon_requeue.py --movies-only --since yesterday --include-partial --dry-run
 python playon_requeue.py --title "Mythbusters" --since this-week --restart
+python playon_requeue.py --analyze
 ```
 
 options:
@@ -78,3 +80,4 @@ options:
   --limit LIMIT         Limit the number of items to re-queue (applied after filtering).
   --verbose             Print verbose output, including SQL statements and raw data rows.
   --no-backup           Skip creating a database backup (NOT RECOMMENDED).
+  --analyze             Provides a detailed report of the current queue and exits.
