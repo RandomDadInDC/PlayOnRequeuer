@@ -49,7 +49,7 @@ Command-line Flags (stackable)
 - `--limit N`             Limit the number of items to re-queue.
 - `--verbose`             Print verbose output, like SQL statements.
 - `--no-backup`           Skip creating a database backup (NOT RECOMMENDED).
-
+- `--analyze`             Provides a detailed report of the current queue and exits.
 
 Examples
 --------
@@ -59,6 +59,7 @@ python playon_requeue.py --title "Columbo" --since 06-01-24 --position beginning
 python playon_requeue.py --title "Babylon 5" --position after --after-title "Babylon 5"
 python playon_requeue.py --movies-only --since yesterday --include-partial --dry-run
 python playon_requeue.py --title "Mythbusters" --since this-week --restart
+python playon_requeue.py --analyze
 ```
 """
 
@@ -73,6 +74,8 @@ import subprocess
 import sys
 import csv
 import time
+import ctypes
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
@@ -84,11 +87,34 @@ BACKUP_TEMPLATE = "recording.db.bak-{stamp}"
 PROCESS_NAMES   = (
     "PlayOn", "MediaMallServer", "MediaMall", "SettingsManager", "POC-Downloader"
 )
+PLAYON_SERVICE_NAME = "PlayOn"
 
 # ---------------------------------------------------------------------------
 #  Utility: Pretty Timestamp
 # ---------------------------------------------------------------------------
 STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# ---------------------------------------------------------------------------
+#  Windows Privilege Management Utilities
+# ---------------------------------------------------------------------------
+def is_admin():
+    """Check if the script is running with administrative privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def run_as_admin():
+    """
+    Re-launches the script with administrator privileges using a UAC prompt.
+    """
+    try:
+        params = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        return True
+    except Exception as e:
+        print(f"Error attempting to elevate privileges: {e}")
+        return False
 
 # ---------------------------------------------------------------------------
 #  Utility: Interpolate SQL for logging
@@ -109,6 +135,33 @@ def interpolate_sql(sql: str, params: List) -> str:
             result += '?'
         result += part
     return result
+
+# ---------------------------------------------------------------------------
+#  Utility: Format seconds into a human-readable string
+# ---------------------------------------------------------------------------
+def format_duration(total_seconds: float) -> str:
+    """Converts a duration in seconds to a Wd Hh Mm format."""
+    if not total_seconds or total_seconds < 0:
+        total_seconds = 0
+    
+    total_seconds = int(total_seconds)
+    
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    weeks, days = divmod(days, 7)
+    
+    parts = []
+    if weeks > 0:
+        parts.append(f"{weeks}w")
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+        
+    return " ".join(parts) if parts else "0m"
 
 # ---------------------------------------------------------------------------
 #  Utility: Parse --since into a UTC datetime
@@ -147,7 +200,6 @@ def find_playon_processes() -> List[Tuple[int, str]]:
                     if path and pid_str:
                         processes.append((int(pid_str), path))
     except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
-        # Fallback to tasklist if WMIC fails, though this won't get paths for restart.
         return [(pid, "") for pid in find_running_pids_fallback()]
     return processes
 
@@ -168,25 +220,29 @@ def find_running_pids_fallback() -> List[int]:
 #  Utility: Restart PlayOn Services
 # ---------------------------------------------------------------------------
 def restart_services(paths: List[str]):
-    """Restarts the provided list of executables, prioritizing the server."""
+    """
+    Restarts the provided list of executables. It uses 'net start' for the
+    Windows Service and Popen for regular applications.
+    """
     print("\nRestarting PlayOn services...")
-    server_path = None
+    server_was_running = False
     other_paths = []
 
     for path in paths:
         if os.path.basename(path).lower() == 'mediamallserver.exe':
-            server_path = path
+            server_was_running = True
         else:
             other_paths.append(path)
 
-    if server_path:
+    if server_was_running:
         try:
-            print(f"  Starting server: {server_path}")
-            subprocess.Popen([server_path])
+            print(f"  Starting PlayOn service ({PLAYON_SERVICE_NAME})...")
+            subprocess.run(["net", "start", PLAYON_SERVICE_NAME], check=True, capture_output=True)
             print("  Waiting 10 seconds for server to initialize...")
             time.sleep(10)
-        except OSError as e:
-            print(f"  Error starting server: {e}")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"  Error starting PlayOn service: {e}")
+            print("  This usually means the script was not run with administrator privileges.")
             return
 
     for path in other_paths:
@@ -241,6 +297,133 @@ def compute_insert_ranks(cur, count: int, position: str, after_title: str | None
     row = cur.execute("SELECT Rank FROM RecordQueueItems WHERE (SeriesTitle = ? OR Name = ?) AND Status IN (0,1) ORDER BY Rank DESC LIMIT 1", (after_title, after_title)).fetchone()
     if row is None: raise ValueError(f'Anchor title "{after_title}" not found in current queue.')
     return [row[0] + (i + 1) * 0.001 for i in range(count)]
+
+# ---------------------------------------------------------------------------
+#  Main Script Logic
+# ---------------------------------------------------------------------------
+def analyze_queue(args):
+    """Connects to the DB and provides a detailed analysis of the current queue."""
+    try:
+        con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+        cur = con.cursor()
+    except sqlite3.Error as e:
+        print(f"Error connecting to database: {e}")
+        sys.exit(1)
+
+    # Get all successfully recorded library items to check against.
+    library_identifiers = set()
+    try:
+        # Status = 0 means a successful recording in the library.
+        cur.execute("SELECT Name, SeriesTitle, Season, EpisodeNumber FROM LibraryItems WHERE Status = 0")
+        for name, series_title, season, episode in cur.fetchall():
+            if series_title and season is not None and episode is not None:
+                # TV Show identifier: (series title, season, episode)
+                library_identifiers.add((series_title.lower(), int(season), int(episode)))
+            elif name:
+                # Movie identifier: (movie title, None, None)
+                library_identifiers.add((name.lower(), None, None))
+    except sqlite3.Error:
+        library_items = set() # Table might not exist in older DBs
+
+    query = "SELECT Name, SeriesTitle, Duration, ProviderID, Season, EpisodeNumber, Status FROM RecordQueueItems WHERE Status IN (0, 1) ORDER BY Rank"
+    try:
+        all_queue_items = cur.execute(query).fetchall()
+        con.close()
+    except sqlite3.Error as e:
+        print(f"Error querying database: {e}")
+        con.close()
+        return
+
+    if not all_queue_items:
+        print("Recording queue is empty.")
+        return
+
+    active_recording = None
+    queued_recordings = []
+    for item in all_queue_items:
+        if item[6] == 1: # Status is the 7th column (index 6)
+            active_recording = item
+        else:
+            queued_recordings.append(item)
+
+    total_duration_seconds = 0
+    unique_items_in_queue = defaultdict(list)
+    providers = defaultdict(list)
+    movies_count = 0
+    tv_episodes_count = 0
+    tv_series_episodes = defaultdict(int)
+    already_recorded_list = []
+    
+    print("="*50)
+    print("PlayOn Queue Analysis Report")
+    print("="*50)
+
+    # Process active recording first
+    if active_recording:
+        name, series_title, duration_ms, provider_id, season, episode, status = active_recording
+        title = series_title or name
+        duration_sec = (duration_ms or 0) / 1000.0
+        total_duration_seconds += duration_sec
+        print("\n[ Active Recording ]")
+        print(f"- {title} ({format_duration(duration_sec)})")
+
+    # Process queued recordings
+    for i, (name, series_title, duration_ms, provider_id, season, episode, status) in enumerate(queued_recordings):
+        title = series_title or name
+        duration_sec = (duration_ms or 0) / 1000.0
+        total_duration_seconds += duration_sec
+        
+        item_identifier = None
+        if series_title and season is not None and episode is not None:
+            tv_episodes_count += 1
+            tv_series_episodes[series_title] += 1
+            item_identifier = (series_title.lower(), int(season), int(episode))
+        else:
+            movies_count += 1
+            item_identifier = (name.lower(), None, None)
+
+        unique_items_in_queue[item_identifier].append(f"#{i+1}")
+        providers[provider_id or 'unknown'].append(title)
+        
+        if item_identifier in library_identifiers:
+            already_recorded_list.append(title)
+
+    # --- Print Summary ---
+    print("\n[ Queue Summary ]")
+    print(f"Total Items in Queue: {len(queued_recordings)}")
+    print(f"  - Movies: {movies_count}")
+    print(f"  - TV Episodes: {tv_episodes_count}")
+    print(f"Total Anticipated Duration: {format_duration(total_duration_seconds)}")
+
+    # --- Print Duplicates ---
+    duplicates = {item: pos for item, pos in unique_items_in_queue.items() if len(pos) > 1}
+    if duplicates:
+        print("\n[ Duplicate Items in Queue ]")
+        for (title, season, episode), positions in sorted(duplicates.items()):
+            display_title = f"{title.title()} S{int(season):02d}E{int(episode):02d}" if season is not None else title.title()
+            print(f"- {display_title} (at positions {', '.join(positions)})")
+
+    # --- Print Already Recorded ---
+    if already_recorded_list:
+        print("\n[ Already Recorded Items in Queue ]")
+        for title in sorted(set(already_recorded_list)):
+            print(f"- {title}")
+
+    # --- Print TV Series Breakdown ---
+    if tv_series_episodes:
+        print("\n[ TV Series Episode Counts ]")
+        for series, count in sorted(tv_series_episodes.items()):
+            plural = "s" if count > 1 else ""
+            print(f"- {series}: {count} episode{plural}")
+
+    # --- Print Breakdown by Provider ---
+    print("\n[ Recordings by Provider ]")
+    for provider, titles in sorted(providers.items()):
+        print(f"\n--- {provider.capitalize()} ({len(titles)} items) ---")
+        for title in sorted(set(titles)):
+            print(f"- {title}")
+    
+    print("\n" + "="*50)
 
 def requeue_items(args):
     try:
@@ -307,7 +490,7 @@ def requeue_items(args):
         print("Backing up database...")
         backup_database(args.db)
 
-    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    utc_now = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     
     print("Promoting items in the database...")
     try:
@@ -340,6 +523,7 @@ def parse_args():
     p.add_argument("--limit", type=int, help="Limit the number of items to re-queue (applied after filtering).")
     p.add_argument("--verbose", action="store_true", help="Print verbose output, including SQL statements and raw data rows.")
     p.add_argument("--no-backup", action="store_true", help="Skip creating a database backup (NOT RECOMMENDED).")
+    p.add_argument("--analyze", action="store_true", help="Provides a detailed report of the current queue and exits.")
     return p.parse_args()
 
 def main():
@@ -350,6 +534,19 @@ def main():
 
     args = parse_args()
     
+    if args.analyze:
+        analyze_queue(args)
+        sys.exit(0)
+
+    if args.restart and not is_admin():
+        print("The --restart flag requires administrator privileges to start the PlayOn service.")
+        print("Attempting to re-launch with elevated rights...")
+        if run_as_admin():
+            sys.exit(0)
+        else:
+            print("\nFailed to elevate privileges. Please run the script from an administrator command prompt to use --restart.")
+            sys.exit(1)
+
     if args.position == 'after' and not args.after_title:
         print("Error: --after-title is required when using --position 'after'"); sys.exit(1)
     if not any([args.title, args.since, args.movies_only, args.include_partial, args.all]):
